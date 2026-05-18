@@ -1,0 +1,17 @@
+name: proveface_example
+description: Example app for the proveface package.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=2.17.0 <4.0.0"
+  flutter: ">=3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  proveface:
+    path: ../
+
+flutter:
+  uses-material-design: true
