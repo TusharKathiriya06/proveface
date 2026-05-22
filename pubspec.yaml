@@ -2,7 +2,7 @@ name: proveface
 description: >
   Real-time face liveness detection for Flutter. Blink, smile, and head-turn
   challenges with passive anti-spoofing. Camera permission handled internally.
-version: 1.0.0
+version: 1.0.2
 homepage: https://github.com/TusharKathiriya06/proveface
 
 environment:

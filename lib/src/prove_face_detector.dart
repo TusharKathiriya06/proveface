@@ -14,6 +14,8 @@ import 'face_check_status.dart';
 import 'prove_face_config.dart';
 import 'prove_face_result.dart';
 
+part 'prove_face_detector_android.dart';
+
 // ─── Internal challenge enum ──────────────────────────────────────────────────
 
 enum _Challenge { blink, smile, turnLeft, turnRight, turnUp, turnDown }
@@ -56,7 +58,9 @@ class ProveFaceDetector extends StatefulWidget {
   }) : super(key: key);
 
   @override
-  State<ProveFaceDetector> createState() => _ProveFaceDetectorState();
+  State<ProveFaceDetector> createState() => Platform.isAndroid
+      ? _ProveFaceDetectorAndroidState()
+      : _ProveFaceDetectorState();
 }
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -98,9 +102,10 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
   CameraController?  _cameraController;
 
   // ── Processing guards ─────────────────────────────────────────────────────
-  bool _canProcess  = true;
-  bool _isBusy      = false;
-  bool _isCapturing = false;
+  bool _canProcess       = true;
+  bool _isBusy           = false;
+  bool _isCapturing      = false;
+  bool _cameraInitializing = false;
 
   // ── Passive anti-spoof ────────────────────────────────────────────────────
   bool _spoofModelReady = false;
@@ -109,6 +114,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
   // ── Challenge pool ────────────────────────────────────────────────────────
   List<_Challenge> _challengePool  = [];
   int              _challengeIndex = 0;
+  int?             _trackedFaceId;
 
   // ── Blink state ───────────────────────────────────────────────────────────
   bool _blinkDone     = false;
@@ -198,7 +204,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+    if (_cameraController == null || !_cameraController!.value.isInitialized) { return; }
     if (state == AppLifecycleState.inactive) {
       _stopCamera();
     } else if (state == AppLifecycleState.resumed) {
@@ -249,13 +255,12 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
 
   void _buildChallengePool() {
     final pool = <_Challenge>[];
-    if (_cfg.enableBlink)     pool.add(_Challenge.blink);
-    if (_cfg.enableSmile)     pool.add(_Challenge.smile);
-    if (_cfg.enableTurnLeft)  pool.add(_Challenge.turnLeft);
-    if (_cfg.enableTurnRight) pool.add(_Challenge.turnRight);
-    if (_cfg.enableTurnUp)    pool.add(_Challenge.turnUp);
-    if (_cfg.enableTurnDown)  pool.add(_Challenge.turnDown);
-    if (pool.isEmpty)         pool.add(_Challenge.blink);
+    if (_cfg.enableBlink)     { pool.add(_Challenge.blink); }
+    if (_cfg.enableSmile)     { pool.add(_Challenge.smile); }
+    if (_cfg.enableTurnLeft)  { pool.add(_Challenge.turnLeft); }
+    if (_cfg.enableTurnRight) { pool.add(_Challenge.turnRight); }
+    if (_cfg.enableTurnUp)    { pool.add(_Challenge.turnUp); }
+    if (_cfg.enableTurnDown)  { pool.add(_Challenge.turnDown); }
     pool.shuffle(Random());
     _challengePool  = pool;
     _challengeIndex = 0;
@@ -268,27 +273,29 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
   Future<void> _initPassiveModel() async {
     try {
       final status = await FaceAntiSpoofingDetector.initialize();
-      if (mounted) setState(() => _spoofModelReady = status == true);
+      if (mounted) { setState(() => _spoofModelReady = status == true); }
     } catch (e) {
       debugPrint('[ProveFace] Passive spoof model init failed: $e');
     }
   }
 
   Future<void> _initCamera() async {
-    final cameras = await availableCameras();
-    _camera = cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.front,
-      orElse: () => cameras.first,
-    );
-    _cameraController = CameraController(
-      _camera!,
-      ResolutionPreset.high,
-      enableAudio: false,
-      imageFormatGroup: Platform.isAndroid
-          ? ImageFormatGroup.nv21
-          : ImageFormatGroup.bgra8888,
-    );
+    if (_cameraInitializing) return;
+    _cameraInitializing = true;
     try {
+      final cameras = await availableCameras();
+      _camera = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.front,
+        orElse: () => cameras.first,
+      );
+      _cameraController = CameraController(
+        _camera!,
+        ResolutionPreset.high,
+        enableAudio: false,
+        imageFormatGroup: Platform.isAndroid
+            ? ImageFormatGroup.nv21
+            : ImageFormatGroup.bgra8888,
+      );
       await _cameraController!.initialize();
       if (!mounted) return;
       await _cameraController!.lockCaptureOrientation(DeviceOrientation.portraitUp);
@@ -298,13 +305,16 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
       setState(() {});
     } catch (e) {
       debugPrint('[ProveFace] Camera init failed: $e');
+    } finally {
+      _cameraInitializing = false;
     }
   }
 
   Future<void> _stopCamera() async {
-    try { await _cameraController?.stopImageStream(); } catch (_) {}
-    await _cameraController?.dispose();
+    final ctrl = _cameraController;
     _cameraController = null;
+    try { await ctrl?.stopImageStream(); } catch (_) {}
+    try { await ctrl?.dispose(); } catch (_) {}
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -314,20 +324,20 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
   void _startSessionTimer() {
     _sessionTimer?.cancel();
     final timeout = _cfg.effectiveSessionTimeout;
-    if (timeout <= 0) return;
+    if (timeout <= 0) { return; }
     _sessionSecondsLeft = timeout;
     _sessionTimer = Timer(Duration(seconds: timeout), () {
-      if (mounted) _restart(message: 'Session timed out. Please try again.');
+      if (mounted && !_isCapturing) _restart(message: 'Session timed out. Please try again.');
     });
   }
 
   void _startUiTicker() {
     _uiTicker?.cancel();
     _uiTicker = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted) return;
+      if (!mounted) { return; }
       setState(() {
-        if (_sessionSecondsLeft   > 0) _sessionSecondsLeft--;
-        if (_challengeSecondsLeft > 0) _challengeSecondsLeft--;
+        if (_sessionSecondsLeft   > 0) { _sessionSecondsLeft--; }
+        if (_challengeSecondsLeft > 0) { _challengeSecondsLeft--; }
       });
     });
   }
@@ -370,7 +380,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
   // ─────────────────────────────────────────────────────────────────────────
 
   void _onCameraImage(CameraImage image) {
-    if (!_canProcess || _isBusy || _isCapturing) return;
+    if (!_canProcess || _isBusy || _isCapturing) { return; }
     _isBusy = true;
     _processFrame(image).whenComplete(() {
       _isBusy = false;
@@ -382,7 +392,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
     _frameIdx++;
 
     final inputImage = _buildInputImage(image);
-    if (inputImage == null) return;
+    if (inputImage == null) { return; }
 
     List<Face> faces;
     try {
@@ -391,6 +401,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
       debugPrint('[ProveFace] FaceDetector error: $e');
       return;
     }
+    if (!_canProcess || !mounted) return;
 
     final _Challenge? activeTurn = _challengeIndex < _challengePool.length
         ? _challengePool[_challengeIndex]
@@ -402,10 +413,19 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
         activeTurn == _Challenge.turnDown;
 
     if (faces.isEmpty) {
-      if (isTurnChallengeActive && _turnStarted) {
+      // After completing at least one challenge, any face loss = full restart
+      if (_challengeIndex > 0) {
+        if (_isCapturing) return;
+        _restart(message: 'Face not detected. Please restart verification.');
+        return;
+      }
+      // First challenge started but not yet complete — short grace period
+      if (_blinkStarted || _smileStarted || _turnStarted) {
         _noFaceGraceCount++;
         if (_noFaceGraceCount < _noFaceGraceMax) {
-          _commitStatus(_waitingStatusFor(activeTurn!));
+          if (isTurnChallengeActive && _turnStarted) {
+            _commitStatus(_waitingStatusFor(activeTurn!));
+          }
           return;
         }
       }
@@ -425,9 +445,10 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
     final face      = faces.first;
     // ── CHANGE 1: use inputImageData (v0.9 API) instead of metadata (v0.11) ─
     final imageSize = inputImage.metadata!.size;
-    final yaw       = face.headEulerAngleY ?? 0.0;
-    final pitch     = face.headEulerAngleX ?? 0.0;
-    final roll      = face.headEulerAngleZ ?? 0.0;
+
+    final yaw   = _correctedYaw(face);
+    final pitch = face.headEulerAngleX ?? 0.0;
+    final roll  = face.headEulerAngleZ ?? 0.0;
 
     final distance = _calcFaceDistance(face);
     if (distance > _tooCloseThreshold) { _commitStatus(FaceCheckStatus.tooClose);  return; }
@@ -454,17 +475,33 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
 
     if (!isTurnChallengeActive && _frameIdx % 4 == 0) {
       final qualityStatus = await _checkImageQuality(image, face, imageSize);
+      if (!_canProcess || !mounted) return;
       if (qualityStatus != null) { _commitStatus(qualityStatus); return; }
     }
 
     if (_frameIdx % 6 == 0 && _spoofModelReady && _lastFaceBoundingBox != null) {
       final spoofStatus = await _checkPassiveLiveness(image, face);
+      if (!_canProcess || !mounted) return;
       if (spoofStatus != null) { _commitStatus(spoofStatus); return; }
     }
 
     if (_frameIdx % 8 == 0) {
       final screenStatus = _checkScreenArtifacts(image, face);
       if (screenStatus != null) { _commitStatus(screenStatus); return; }
+    }
+
+    final bool anyChallengeLive = _blinkStarted || _smileStarted || _turnStarted;
+
+    // Before any challenge starts, track the current face.
+    // Once a challenge is live, lock the ID and restart if it changes.
+    if (face.trackingId != null) {
+      if (!anyChallengeLive) {
+        _trackedFaceId = face.trackingId;
+      } else if (_trackedFaceId != null && face.trackingId != _trackedFaceId) {
+        if (_isCapturing) return;
+        _restart(message: 'Different face detected. Please restart verification.');
+        return;
+      }
     }
 
     while (_challengeIndex < _challengePool.length) {
@@ -494,17 +531,17 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
   }
 
   FaceCheckStatus? _runBlinkChallenge(Face face) {
-    if (_blinkDone) return null;
+    if (_blinkDone) { return null; }
     if (!_blinkStarted) { _blinkStarted = true; _startBlinkTimer(); }
-    if (_blinkTimedOut) return FaceCheckStatus.blinkTimedOut;
+    if (_blinkTimedOut) { return FaceCheckStatus.blinkTimedOut; }
     _detectBlink(face);
     return _blinkDone ? null : FaceCheckStatus.waitingForBlink;
   }
 
   FaceCheckStatus? _runSmileChallenge(Face face) {
-    if (_smileDone) return null;
+    if (_smileDone) { return null; }
     if (!_smileStarted) { _smileStarted = true; _startSmileTimer(); }
-    if (_smileTimedOut) return FaceCheckStatus.smileTimedOut;
+    if (_smileTimedOut) { return FaceCheckStatus.smileTimedOut; }
     _detectSmile(face);
     return _smileDone ? null : FaceCheckStatus.waitingForSmile;
   }
@@ -520,10 +557,10 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
       return null;
     }
     if (!_turnStarted) { _turnStarted = true; _startTurnTimer(); }
-    if (_turnTimedOut) return FaceCheckStatus.turnTimedOut;
+    if (_turnTimedOut) { return FaceCheckStatus.turnTimedOut; }
     _detectTurn(c, yaw, pitch);
-    if (_isTurnDone(c)) return null;
-    if (_isTurnExtremeReached(c)) return FaceCheckStatus.returnToCenter;
+    if (_isTurnDone(c)) { return null; }
+    if (_isTurnExtremeReached(c)) { return FaceCheckStatus.returnToCenter; }
     return _waitingStatusFor(c);
   }
 
@@ -560,7 +597,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
   void _detectBlink(Face face) {
     final l = face.leftEyeOpenProbability  ?? 1.0;
     final r = face.rightEyeOpenProbability ?? 1.0;
-    if (l < _eyeClosedThreshold && r < _eyeClosedThreshold) _wasEyesClosed = true;
+    if (l < _eyeClosedThreshold && r < _eyeClosedThreshold) { _wasEyesClosed = true; }
     if (_wasEyesClosed && l > _eyeOpenThreshold && r > _eyeOpenThreshold) {
       _blinkDone = true;
       _blinkTimer?.cancel();
@@ -582,15 +619,15 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
 
   void _detectTurn(_Challenge c, double yaw, double pitch) {
     _yawBuffer.add(yaw);
-    if (_yawBuffer.length > _angleBufferSize) _yawBuffer.removeAt(0);
+    if (_yawBuffer.length > _angleBufferSize) { _yawBuffer.removeAt(0); }
     _pitchBuffer.add(pitch);
-    if (_pitchBuffer.length > _angleBufferSize) _pitchBuffer.removeAt(0);
+    if (_pitchBuffer.length > _angleBufferSize) { _pitchBuffer.removeAt(0); }
 
     final smoothYaw   = _yawBuffer.reduce((a, b)   => a + b) / _yawBuffer.length;
     final smoothPitch = _pitchBuffer.reduce((a, b) => a + b) / _pitchBuffer.length;
 
     void checkExtreme(bool alreadyReached, bool atExtreme, void Function() onConfirmed) {
-      if (alreadyReached) return;
+      if (alreadyReached) { return; }
       if (atExtreme) {
         _turnExtremeFrames++;
         if (_turnExtremeFrames >= _turnExtremeFramesRequired) {
@@ -658,7 +695,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
       final y0 = bb.top.toInt().clamp(0, h - 1);
       final x1 = (bb.right.toInt()).clamp(0, w);
       final y1 = (bb.bottom.toInt()).clamp(0, h);
-      if (x1 - x0 < 10 || y1 - y0 < 10) return null;
+      if (x1 - x0 < 10 || y1 - y0 < 10) { return null; }
 
       double sum = 0, sumSq = 0; int count = 0;
       for (int row = y0; row < y1; row++) {
@@ -679,9 +716,9 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
           rowSum += (gray[row * w + col + 1] - gray[row * w + col]).abs().toDouble();
           rowN++;
         }
-        if (rowN > 0) rowMeans.add(rowSum / rowN);
+        if (rowN > 0) { rowMeans.add(rowSum / rowN); }
       }
-      if (rowMeans.length < 4) return null;
+      if (rowMeans.length < 4) { return null; }
       final rmMean = rowMeans.reduce((a, b) => a + b) / rowMeans.length;
       double rmVar = 0;
       for (final v in rowMeans) { rmVar += (v - rmMean) * (v - rmMean); }
@@ -701,7 +738,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
     final bb = face.boundingBox;
     final visibleLandmarks = face.landmarks.values.where((lm) => lm != null).length;
     final visibilityRatio  = visibleLandmarks / FaceLandmarkType.values.length;
-    if (visibilityRatio < _landmarkVisibilityThreshold) return FaceCheckStatus.faceObstructed;
+    if (visibilityRatio < _landmarkVisibilityThreshold) { return FaceCheckStatus.faceObstructed; }
 
     const requiredLm = [
       FaceLandmarkType.leftEye, FaceLandmarkType.rightEye,
@@ -712,9 +749,10 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
       if (face.landmarks[lm] == null) {
         if (lm == FaceLandmarkType.leftMouth  ||
             lm == FaceLandmarkType.rightMouth ||
-            lm == FaceLandmarkType.bottomMouth) return FaceCheckStatus.lowerFaceCovered;
-        if (lm == FaceLandmarkType.leftEye || lm == FaceLandmarkType.rightEye)
+            lm == FaceLandmarkType.bottomMouth) { return FaceCheckStatus.lowerFaceCovered; }
+        if (lm == FaceLandmarkType.leftEye || lm == FaceLandmarkType.rightEye) {
           return FaceCheckStatus.eyesNotVisible;
+        }
         return FaceCheckStatus.faceObstructed;
       }
     }
@@ -736,8 +774,8 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
       final c = contours[ct];
       final minPts = lipContours.contains(ct) ? 5 : 1;
       if (c == null || c.points.length < minPts) {
-        if (lipContours.contains(ct)) return FaceCheckStatus.lowerFaceCovered;
-        if (eyeContours.contains(ct)) return FaceCheckStatus.eyesNotVisible;
+        if (lipContours.contains(ct)) { return FaceCheckStatus.lowerFaceCovered; }
+        if (eyeContours.contains(ct)) { return FaceCheckStatus.eyesNotVisible; }
         return FaceCheckStatus.faceObstructed;
       }
     }
@@ -746,15 +784,15 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
     final lowerLipC = face.contours[FaceContourType.lowerLipBottom]!;
     final upperY = upperLipC.points.map((p) => p.y).reduce((a, b) => a + b) / upperLipC.points.length;
     final lowerY = lowerLipC.points.map((p) => p.y).reduce((a, b) => a + b) / lowerLipC.points.length;
-    if ((lowerY - upperY).abs() < bb.height * 0.03) return FaceCheckStatus.lowerFaceCovered;
+    if ((lowerY - upperY).abs() < bb.height * 0.03) { return FaceCheckStatus.lowerFaceCovered; }
 
     final leftMouthLm   = face.landmarks[FaceLandmarkType.leftMouth]!;
     final rightMouthLm  = face.landmarks[FaceLandmarkType.rightMouth]!;
     final bottomMouthLm = face.landmarks[FaceLandmarkType.bottomMouth]!;
     final mouthRelY = (bottomMouthLm.position.y - bb.top) / bb.height;
-    if (mouthRelY < 0.50 || mouthRelY > 0.95) return FaceCheckStatus.lowerFaceCovered;
+    if (mouthRelY < 0.50 || mouthRelY > 0.95) { return FaceCheckStatus.lowerFaceCovered; }
     final mouthWidth = (rightMouthLm.position.x - leftMouthLm.position.x).abs();
-    if (mouthWidth < bb.width * 0.20) return FaceCheckStatus.lowerFaceCovered;
+    if (mouthWidth < bb.width * 0.20) { return FaceCheckStatus.lowerFaceCovered; }
 
     return _checkSunglasses(face, bb);
   }
@@ -762,13 +800,13 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
   FaceCheckStatus? _checkSunglasses(Face face, Rect bb) {
     for (final eyeType in [FaceContourType.leftEye, FaceContourType.rightEye]) {
       final eyeContour = face.contours[eyeType];
-      if (eyeContour == null || eyeContour.points.length < 4) continue;
+      if (eyeContour == null || eyeContour.points.length < 4) { continue; }
       final xs = eyeContour.points.map((p) => p.x.toDouble()).toList();
       final ys = eyeContour.points.map((p) => p.y.toDouble()).toList();
       final cW = xs.reduce(max) - xs.reduce(min);
       final cH = ys.reduce(max) - ys.reduce(min);
-      if (cW <= 0) continue;
-      if (cH / cW < 0.12) return FaceCheckStatus.sunglassesDetected;
+      if (cW <= 0) { continue; }
+      if (cH / cW < 0.12) { return FaceCheckStatus.sunglassesDetected; }
     }
     return null;
   }
@@ -777,25 +815,27 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
     final bb = face.boundingBox;
     final leftCheek  = face.landmarks[FaceLandmarkType.leftCheek];
     final rightCheek = face.landmarks[FaceLandmarkType.rightCheek];
-    if (leftCheek == null || rightCheek == null) return FaceCheckStatus.faceObstructed;
+    if (leftCheek == null || rightCheek == null) { return FaceCheckStatus.faceObstructed; }
     for (final cheek in [leftCheek, rightCheek]) {
       final relY = (cheek.position.y - bb.top) / bb.height;
-      if (relY < 0.20 || relY > 0.62) return FaceCheckStatus.faceObstructed;
+      if (relY < 0.20 || relY > 0.62) { return FaceCheckStatus.faceObstructed; }
     }
 
     final noseLm = face.landmarks[FaceLandmarkType.noseBase];
     if (noseLm != null) {
       final relY = (noseLm.position.y - bb.top) / bb.height;
       final relX = (noseLm.position.x - bb.left) / bb.width;
-      if (relY < 0.38 || relY > 0.68 || relX < 0.28 || relX > 0.72)
+      if (relY < 0.38 || relY > 0.68 || relX < 0.28 || relX > 0.72) {
         return FaceCheckStatus.faceObstructed;
+      }
     }
 
     final leftEye  = face.landmarks[FaceLandmarkType.leftEye];
     final rightEye = face.landmarks[FaceLandmarkType.rightEye];
     if (leftEye != null && rightEye != null) {
-      if ((leftEye.position.y - rightEye.position.y).abs() > bb.height * 0.15)
+      if ((leftEye.position.y - rightEye.position.y).abs() > bb.height * 0.15) {
         return FaceCheckStatus.faceObstructed;
+      }
     }
 
     final faceContour = face.contours[FaceContourType.face];
@@ -807,7 +847,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
         final next = pts[(i + 1) % pts.length];
         final dx   = (curr.x - next.x).toDouble();
         final dy   = (curr.y - next.y).toDouble();
-        if (sqrt(dx * dx + dy * dy) > maxGap) return FaceCheckStatus.faceObstructed;
+        if (sqrt(dx * dx + dy * dy) > maxGap) { return FaceCheckStatus.faceObstructed; }
       }
     }
     return null;
@@ -826,8 +866,8 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
         grayBytes, w, h,
         bb.left.toInt(), bb.top.toInt(), bb.width.toInt(), bb.height.toInt(),
       );
-      if (faceBrightness < _darkThreshold)   return FaceCheckStatus.poorLighting;
-      if (faceBrightness > _brightThreshold) return FaceCheckStatus.overExposed;
+      if (faceBrightness < _darkThreshold)   { return FaceCheckStatus.poorLighting; }
+      if (faceBrightness > _brightThreshold) { return FaceCheckStatus.overExposed; }
 
       final leftEyeLm  = face.landmarks[FaceLandmarkType.leftEye];
       final rightEyeLm = face.landmarks[FaceLandmarkType.rightEye];
@@ -837,7 +877,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
         final eY = (leftEyeLm.position.y - eH / 2).toInt();
         final lB = _roiMean(grayBytes, w, h, (leftEyeLm.position.x  - eW / 2).toInt(), eY, eW, eH);
         final rB = _roiMean(grayBytes, w, h, (rightEyeLm.position.x - eW / 2).toInt(), eY, eW, eH);
-        if ((lB + rB) / 2 < _darkGlassThreshold) return FaceCheckStatus.darkGlasses;
+        if ((lB + rB) / 2 < _darkGlassThreshold) { return FaceCheckStatus.darkGlasses; }
       }
     } catch (e) {
       debugPrint('[ProveFace] Quality check error: $e');
@@ -847,8 +887,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
 
   Future<FaceCheckStatus?> _checkPassiveLiveness(CameraImage image, Face face) async {
     try {
-      final Uint8List yuvBytes =
-          Platform.isAndroid ? _buildNV21(image) : image.planes.first.bytes;
+      final Uint8List yuvBytes = _spoofInputBytes(image);
       final score = await FaceAntiSpoofingDetector.detect(
         yuvBytes:      yuvBytes,
         previewWidth:  image.width,
@@ -858,7 +897,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
       );
       if (score != null) {
         _spoofScores.add(score);
-        if (_spoofScores.length > _spoofFrameWindow) _spoofScores.removeAt(0);
+        if (_spoofScores.length > _spoofFrameWindow) { _spoofScores.removeAt(0); }
         if (_spoofScores.length >= 4) {
           final avg = _spoofScores.reduce((a, b) => a + b) / _spoofScores.length;
           if (avg < _spoofThreshold) return FaceCheckStatus.spoofDetected;
@@ -873,11 +912,11 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
   bool _isMouthGeometryValid(Face face) {
     final lm = face.landmarks[FaceLandmarkType.leftMouth];
     final rm = face.landmarks[FaceLandmarkType.rightMouth];
-    if (lm == null || rm == null) return false;
-    if ((rm.position.x - lm.position.x).abs() < face.boundingBox.width * 0.22) return false;
+    if (lm == null || rm == null) { return false; }
+    if ((rm.position.x - lm.position.x).abs() < face.boundingBox.width * 0.22) { return false; }
     final ul = face.contours[FaceContourType.upperLipTop];
     final ll = face.contours[FaceContourType.lowerLipBottom];
-    if (ul == null || ll == null || ul.points.length < 5 || ll.points.length < 5) return false;
+    if (ul == null || ll == null || ul.points.length < 5 || ll.points.length < 5) { return false; }
     final uY = ul.points.map((p) => p.y).reduce((a, b) => a + b) / ul.points.length;
     final lY = ll.points.map((p) => p.y).reduce((a, b) => a + b) / ll.points.length;
     return (lY - uY).abs() >= face.boundingBox.height * 0.03;
@@ -903,15 +942,19 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
     _noFaceGraceCount = 0;
     _leaveReadyFrames = 0;
     _spoofScores.clear();
-    _buildChallengePool();
+    _challengeIndex = 0;
+    _trackedFaceId  = null;
   }
 
-  void _restart({String message = ''}) {
+  Future<void> _restart({String message = ''}) async {
+    _canProcess = false;
     _blinkTimer?.cancel();
     _smileTimer?.cancel();
     _turnTimer?.cancel();
     _sessionTimer?.cancel();
     _uiTicker?.cancel();
+
+    await _stopCamera();
 
     if (mounted) {
       setState(() {
@@ -931,6 +974,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
         _yawBuffer.clear();
         _pitchBuffer.clear();
         _noFaceGraceCount = 0;
+        _trackedFaceId    = null;
 
         _leaveReadyFrames = 0;
         _frameIdx         = 0;
@@ -952,7 +996,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
       _buildChallengePool();
     }
 
-    _initCamera();
+    await _initCamera();
 
     if (message.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1004,6 +1048,11 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
 
   Future<void> _captureImage() async {
     if (_status != FaceCheckStatus.ready || _isCapturing) return;
+    _sessionTimer?.cancel();
+    _blinkTimer?.cancel();
+    _smileTimer?.cancel();
+    _turnTimer?.cancel();
+    _uiTicker?.cancel();
     setState(() => _isCapturing = true);
     try {
       await _cameraController!.stopImageStream();
@@ -1018,7 +1067,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
         _isWaitingToComplete = true;
       });
 
-      final failReason = await _validateCapturedImage(file.path);
+      final failReason = await _validateCapturedImage(file.path, bytes);
       if (!mounted) return;
 
       if (failReason != null) { _restart(message: failReason); return; }
@@ -1037,9 +1086,33 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
     }
   }
 
-  Future<String?> _validateCapturedImage(String imagePath) async {
+  Future<String?> _validateCapturedImage(String imagePath, Uint8List jpegBytes) async {
     try {
-      final InputImage inputImage = await _buildInputImageFromFile(imagePath);
+      // Confirm the file is fully written to disk before reading
+      final file = File(imagePath);
+      for (int i = 0; i < 5; i++) {
+        if (await file.exists() && (await file.length()) > 0) break;
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+      if (!await file.exists()) return 'Captured image not found. Please try again.';
+
+      // Decode at stream-like resolution (640 px wide) so ML Kit behaves
+      // consistently with the live stream — at full resolution ML Kit
+      // estimates landmarks under occlusions, defeating the coverage checks.
+      final codec = await ui.instantiateImageCodec(jpegBytes, targetWidth: 640);
+      final frame = await codec.getNextFrame();
+      final img   = frame.image;
+      final valW  = img.width;
+      final valH  = img.height;
+      final byteData = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+      img.dispose();
+      codec.dispose();
+
+      if (byteData == null) return 'Could not process captured image. Please try again.';
+
+      final rgba       = byteData.buffer.asUint8List();
+      final inputImage = _capturedFrameToInputImage(rgba, valW, valH);
+
       final faces = await _faceDetector.processImage(inputImage);
 
       if (faces.isEmpty)    return 'No face detected in captured image. Please try again.';
@@ -1062,7 +1135,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
       return null;
     } catch (e) {
       debugPrint('[ProveFace] Post-capture validation error: $e');
-      return null;
+      return 'Could not validate captured image. Please try again.';
     }
   }
 
@@ -1108,13 +1181,29 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
     return count > 0 ? sum / count : 128.0;
   }
 
-  Uint8List _buildNV21(CameraImage image) {
-    final y  = image.planes[0];
-    final uv = image.planes[1];
-    final nv21 = Uint8List(y.bytes.length + uv.bytes.length);
-    nv21.setAll(0, y.bytes);
-    nv21.setAll(y.bytes.length, uv.bytes);
-    return nv21;
+  double _correctedYaw(Face face) => face.headEulerAngleY ?? 0.0;
+  Uint8List _spoofInputBytes(CameraImage image) => image.planes.first.bytes;
+
+  // Converts raw RGBA pixels (from ui.ImageByteFormat.rawRgba) into an
+  // InputImage suitable for ML Kit. iOS uses BGRA8888; Android overrides
+  // this in _ProveFaceDetectorAndroidState to produce NV21 instead.
+  InputImage _capturedFrameToInputImage(Uint8List rgba, int width, int height) {
+    final bgra = Uint8List(rgba.length);
+    for (int i = 0; i < rgba.length; i += 4) {
+      bgra[i]     = rgba[i + 2];
+      bgra[i + 1] = rgba[i + 1];
+      bgra[i + 2] = rgba[i];
+      bgra[i + 3] = rgba[i + 3];
+    }
+    return InputImage.fromBytes(
+      bytes: bgra,
+      metadata: InputImageMetadata(
+        size:        Size(width.toDouble(), height.toDouble()),
+        rotation:    InputImageRotation.rotation0deg,
+        format:      InputImageFormat.bgra8888,
+        bytesPerRow: width * 4,
+      ),
+    );
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1135,7 +1224,7 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
     final bb = face.boundingBox;
     final dx = bb.center.dx - imageSize.width  / 2;
     final dy = bb.center.dy - imageSize.height / 2;
-    return (dx * dx + dy * dy) <= (Platform.isIOS ? 20000 : 200000);
+    return (dx * dx + dy * dy) <= 20000;
   }
 
   // ── CHANGE 4: InputImageData (v0.9 API) replaces InputImageMetadata (v0.11) ─
@@ -1172,28 +1261,6 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
         rotation:    rotation,
         format:      format,
         bytesPerRow: plane.bytesPerRow,
-      ),
-    );
-  }
-
-  Future<InputImage> _buildInputImageFromFile(String imagePath) async {
-    if (Platform.isAndroid) return InputImage.fromFilePath(imagePath);
-    final fileBytes = await File(imagePath).readAsBytes();
-    final codec     = await ui.instantiateImageCodec(fileBytes);
-    final frame     = await codec.getNextFrame();
-    final img       = frame.image;
-    final width     = img.width;
-    final height    = img.height;
-    final byteData  = await img.toByteData(format: ui.ImageByteFormat.rawUnmodified);
-    img.dispose();
-    codec.dispose();
-    return InputImage.fromBytes(
-      bytes: byteData!.buffer.asUint8List(),
-      metadata: InputImageMetadata(
-        size:        Size(width.toDouble(), height.toDouble()),
-        rotation:    InputImageRotation.rotation0deg,
-        format:      InputImageFormat.bgra8888,
-        bytesPerRow: width * 4,
       ),
     );
   }
@@ -1268,24 +1335,14 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
 
   _TimerData? get _challengeTimerData {
     if (_isWaitingToComplete || _isCapturing) return null;
-    switch (_status) {
-      case FaceCheckStatus.waitingForBlink:
-        if (_cfg.blinkTimeoutSeconds > 0)
-          return _TimerData('Blink in', _challengeSecondsLeft, _cfg.blinkTimeoutSeconds);
-        break;
-      case FaceCheckStatus.waitingForSmile:
-        if (_cfg.smileTimeoutSeconds > 0)
-          return _TimerData('Smile in', _challengeSecondsLeft, _cfg.smileTimeoutSeconds);
-        break;
-      case FaceCheckStatus.waitingForTurnLeft:
-      case FaceCheckStatus.waitingForTurnRight:
-      case FaceCheckStatus.waitingForTurnUp:
-      case FaceCheckStatus.waitingForTurnDown:
-      case FaceCheckStatus.returnToCenter:
-        if (_cfg.turnTimeoutSeconds > 0)
-          return _TimerData('Turn in', _challengeSecondsLeft, _cfg.turnTimeoutSeconds);
-        break;
-      default: break;
+    if (_blinkStarted && !_blinkDone && _cfg.blinkTimeoutSeconds > 0) {
+      return _TimerData('Blink in', _challengeSecondsLeft, _cfg.blinkTimeoutSeconds);
+    }
+    if (_smileStarted && !_smileDone && _cfg.smileTimeoutSeconds > 0) {
+      return _TimerData('Smile in', _challengeSecondsLeft, _cfg.smileTimeoutSeconds);
+    }
+    if (_turnStarted && _cfg.turnTimeoutSeconds > 0) {
+      return _TimerData('Turn in', _challengeSecondsLeft, _cfg.turnTimeoutSeconds);
     }
     return null;
   }
@@ -1298,9 +1355,9 @@ class _ProveFaceDetectorState extends State<ProveFaceDetector>
   Widget build(BuildContext context) {
     // ── Permission not yet checked — show loading ─────────────────────────
     if (!_permissionChecked) {
-      return Scaffold(
-        backgroundColor: const Color(0xFF0A1628),
-        body: const Center(
+      return const Scaffold(
+        backgroundColor: Color(0xFF0A1628),
+        body: Center(
           child: CircularProgressIndicator(color: Color(0xFF0D4582)),
         ),
       );
